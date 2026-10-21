@@ -31,7 +31,24 @@ function utcDay(d: Date): number {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 }
 
+let sweepInFlight = false;
+
 export async function runOverdueSweep(now: Date = new Date()): Promise<SweepResult> {
+  if (sweepInFlight) {
+    // A previous sweep is still running — skip this tick rather than risk
+    // double-processing the same schedules/bills concurrently.
+    logger.warn("overdue sweep already in flight — skipping this run");
+    return { reconciled: 0, markedUpcoming: 0, markedDueToday: 0, markedOverdue: 0, notificationsCreated: 0 };
+  }
+  sweepInFlight = true;
+  try {
+    return await runOverdueSweepInner(now);
+  } finally {
+    sweepInFlight = false;
+  }
+}
+
+async function runOverdueSweepInner(now: Date): Promise<SweepResult> {
   const today = utcDay(now);
   const dayMs = 86_400_000;
 

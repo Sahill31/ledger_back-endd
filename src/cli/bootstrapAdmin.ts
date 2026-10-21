@@ -16,12 +16,17 @@ async function main() {
     const i = args.indexOf(`--${name}`);
     return i >= 0 ? args[i + 1] : undefined;
   };
-  const email = get("email")?.trim().toLowerCase();
-  const password = get("password");
-  const name = get("name") ?? "Administrator";
+  // CLI flags take precedence; env vars (ADMIN_EMAIL / ADMIN_INITIAL_PASSWORD /
+  // ADMIN_NAME) let the script run unattended on a deploy shell.
+  const email = (get("email") ?? process.env.ADMIN_EMAIL)?.trim().toLowerCase();
+  const password = get("password") ?? process.env.ADMIN_INITIAL_PASSWORD;
+  const name = get("name") ?? process.env.ADMIN_NAME ?? "Administrator";
 
   if (!email || !password) {
-    console.error("Usage: npm run bootstrap:admin -- --email <email> --password <password> [--name <name>]");
+    console.error(
+      "Usage: npm run bootstrap:admin -- --email <email> --password <password> [--name <name>]\n" +
+        "   or: set ADMIN_EMAIL + ADMIN_INITIAL_PASSWORD (+ optional ADMIN_NAME)"
+    );
     process.exit(1);
   }
   if (password.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
@@ -29,9 +34,17 @@ async function main() {
     process.exit(1);
   }
 
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) {
+    // Idempotent: never overwrite an existing account's credentials.
+    console.log(`Account ${email} already exists (${existing.role}) — leaving it unchanged.`);
+    return;
+  }
   const adminCount = await prisma.user.count({ where: { role: "ADMIN" } });
   if (adminCount > 0) {
-    console.error("An admin account already exists. Use POST /api/v1/users as an authenticated admin instead.");
+    console.error(
+      "An admin account already exists. Use POST /api/v1/users as an authenticated admin instead."
+    );
     process.exit(1);
   }
 

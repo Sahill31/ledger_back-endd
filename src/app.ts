@@ -18,11 +18,10 @@ export function createApp() {
   app.use(helmet());
   app.use(
     cors({
-      origin(origin, cb) {
-        // Allow same-origin/non-browser calls (no Origin header) + explicit list.
-        if (!origin || env.corsOrigins.includes(origin)) return cb(null, true);
-        cb(new Error("Origin not allowed by CORS"));
-      },
+      // Reflect any request origin (all origins allowed, incl. rotating
+      // Vercel preview URLs). Credentials still work — cors echoes the
+      // origin back rather than sending "*".
+      origin: true,
       credentials: true,
     })
   );
