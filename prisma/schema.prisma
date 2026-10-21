@@ -1,0 +1,525 @@
+// AutoLedger — Prisma schema
+// PostgreSQL. UUID PKs, TIMESTAMPTZ timestamps, DATE calendar dates,
+// NUMERIC(14,2) for money. Enums are created as real PostgreSQL enum types.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  ADMIN
+  ACCOUNTANT
+
+  @@map("user_role")
+}
+
+enum ScheduleStatus {
+  SCHEDULED
+  UPCOMING
+  AWAITING_BILL
+  DUE_TODAY
+  OVERDUE
+  SUBMITTED
+  UNDER_REVIEW
+  COMPLETED
+  CANCELLED
+
+  @@map("schedule_status")
+}
+
+enum RecurrenceFrequency {
+  MONTHLY
+
+  @@map("recurrence_frequency")
+}
+
+enum BillStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  CORRECTION_REQUESTED
+
+  @@map("bill_status")
+}
+
+enum ReviewDecision {
+  SUBMITTED
+  RESUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  CORRECTION_REQUESTED
+
+  @@map("review_decision")
+}
+
+enum DocumentScanStatus {
+  PROCESSING
+  EXTRACTED
+  PARTIAL
+  FAILED
+
+  @@map("document_scan_status")
+}
+
+enum BudgetComparisonStatus {
+  WITHIN_BUDGET
+  OVER_BUDGET
+  NO_BUDGET
+
+  @@map("budget_comparison_status")
+}
+
+// Values are lowercase so they serialize directly for the existing frontend.
+enum NotificationType {
+  missing_bill
+  deadline_approaching
+  overdue
+  submitted
+  review_request
+  approved
+  rejected
+  resubmitted
+  correction_requested
+  budget_alert
+  system
+
+  @@map("notification_type")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & access
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  fullName     String    @map("full_name")
+  email        String    @unique // stored normalized lowercase; see functional index in migration
+  passwordHash String    @map("password_hash")
+  role         UserRole
+  isActive     Boolean   @default(true) @map("is_active")
+  phone        String?
+  title        String?
+  lastLoginAt  DateTime? @map("last_login_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  assignments          DealershipAssignment[]
+  createdBudgets       BudgetRule[]           @relation("BudgetCreatedBy")
+  budgetChanges        BudgetRuleHistory[]    @relation("BudgetChangedBy")
+  createdSchedules     BillSchedule[]         @relation("ScheduleCreatedBy")
+  assignedSchedules    BillSchedule[]         @relation("ScheduleAssignee")
+  createdRules         RecurringBillingRule[] @relation("RuleCreatedBy")
+  assignedRules        RecurringBillingRule[] @relation("RuleAssignee")
+  submittedBills       Bill[]                 @relation("BillSubmittedBy")
+  reviewedBills        Bill[]                 @relation("BillReviewedBy")
+  reviewEvents         BillReviewHistory[]
+  notifications        Notification[]
+  refreshTokens        RefreshToken[]
+  passwordResetTokens  PasswordResetToken[]
+  documentScans        DocumentScan[]
+
+  @@index([role, isActive])
+  @@map("users")
+}
+
+model Dealership {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  code         String   @unique
+  address      String
+  city         String
+  state        String?
+  contactName  String?  @map("contact_name")
+  contactPhone String?  @map("contact_phone")
+  contactEmail String?  @map("contact_email")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  assignments DealershipAssignment[]
+  budgets     BudgetRule[]
+  schedules   BillSchedule[]
+  recurringRules RecurringBillingRule[]
+  bills       Bill[]
+  documentScans DocumentScan[]
+
+  @@index([isActive])
+  @@map("dealerships")
+}
+
+model DealershipAssignment {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  dealershipId String   @map("dealership_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dealership Dealership @relation(fields: [dealershipId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dealershipId])
+  @@index([userId])
+  @@index([dealershipId])
+  @@map("dealership_assignments")
+}
+
+// ---------------------------------------------------------------------------
+// Categories & budgets
+// ---------------------------------------------------------------------------
+
+model BillCategory {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @unique // case-insensitive policy enforced by functional index in migration
+  description String?
+  icon        String   @default("receipt")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  budgets   BudgetRule[]
+  schedules BillSchedule[]
+  recurringRules RecurringBillingRule[]
+  bills     Bill[]
+  documentScans DocumentScan[]
+
+  @@map("bill_categories")
+}
+
+model BudgetRule {
+  id                       String   @id @default(uuid()) @db.Uuid
+  dealershipId             String   @map("dealership_id") @db.Uuid
+  categoryId               String   @map("category_id") @db.Uuid
+  /// Always the first day of the calendar month the rule applies to.
+  effectiveMonth           DateTime @map("effective_month") @db.Date
+  monthlyAmount            Decimal  @map("monthly_amount") @db.Decimal(14, 2)
+  increaseThresholdPercent Decimal? @map("increase_threshold_percent") @db.Decimal(7, 2)
+  isActive                 Boolean  @default(true) @map("is_active")
+  createdById              String   @map("created_by_id") @db.Uuid
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  dealership Dealership           @relation(fields: [dealershipId], references: [id], onDelete: Restrict)
+  category   BillCategory         @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  createdBy  User                 @relation("BudgetCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  history    BudgetRuleHistory[]
+  bills      Bill[]
+
+  // No conflicting duplicate rules per dealership+category+month.
+  @@unique([dealershipId, categoryId, effectiveMonth])
+  @@index([dealershipId, categoryId, effectiveMonth])
+  @@map("budget_rules")
+}
+
+/// Immutable audit trail for budget amount changes — previously reported
+/// spending limits are never silently rewritten.
+model BudgetRuleHistory {
+  id             String   @id @default(uuid()) @db.Uuid
+  budgetRuleId   String   @map("budget_rule_id") @db.Uuid
+  previousAmount Decimal  @map("previous_amount") @db.Decimal(14, 2)
+  newAmount      Decimal  @map("new_amount") @db.Decimal(14, 2)
+  changedById    String   @map("changed_by_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  budgetRule BudgetRule @relation(fields: [budgetRuleId], references: [id], onDelete: Cascade)
+  changedBy  User       @relation("BudgetChangedBy", fields: [changedById], references: [id], onDelete: Restrict)
+
+  @@index([budgetRuleId, createdAt])
+  @@map("budget_rule_history")
+}
+
+// ---------------------------------------------------------------------------
+// Schedules — recurring rule (template) + BillSchedule rows (monthly tasks)
+// ---------------------------------------------------------------------------
+
+/// A recurring monthly billing rule. The generator job expands each rule into
+/// per-period BillSchedule tasks. Deactivating stops future generation without
+/// touching historical tasks.
+model RecurringBillingRule {
+  id                    String              @id @default(uuid()) @db.Uuid
+  name                  String
+  dealershipId          String              @map("dealership_id") @db.Uuid
+  categoryId            String              @map("category_id") @db.Uuid
+  /// Nullable — assignment may be deferred to the dealership's accountants.
+  assignedAccountantId  String?             @map("assigned_accountant_id") @db.Uuid
+  frequency             RecurrenceFrequency @default(MONTHLY)
+  /// Day-of-month the bill is expected/generated (1-31, clamped to month length).
+  expectedBillDay       Int                 @map("expected_bill_day")
+  /// Day-of-month the accountant must submit by (1-31, clamped).
+  submissionDeadlineDay Int                 @map("submission_deadline_day")
+  /// When true the deadline falls in the month AFTER the billing period.
+  deadlineNextMonth     Boolean             @default(false) @map("deadline_next_month")
+  /// First billing period this rule generates tasks for (first of month).
+  startMonth            DateTime            @map("start_month") @db.Date
+  /// Optional last billing period (first of month). Null = indefinite.
+  endMonth              DateTime?           @map("end_month") @db.Date
+  reminderDaysBefore    Int                 @default(2) @map("reminder_days_before")
+  instructions          String?
+  isActive              Boolean             @default(true) @map("is_active")
+  createdById           String              @map("created_by_id") @db.Uuid
+  createdAt             DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  dealership         Dealership     @relation(fields: [dealershipId], references: [id], onDelete: Restrict)
+  category           BillCategory   @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  assignedAccountant User?          @relation("RuleAssignee", fields: [assignedAccountantId], references: [id], onDelete: SetNull)
+  createdBy          User           @relation("RuleCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  tasks              BillSchedule[]
+
+  @@index([isActive])
+  @@index([dealershipId, categoryId])
+  @@index([assignedAccountantId])
+  @@map("recurring_billing_rules")
+}
+
+model BillSchedule {
+  id                   String         @id @default(uuid()) @db.Uuid
+  dealershipId         String         @map("dealership_id") @db.Uuid
+  categoryId           String         @map("category_id") @db.Uuid
+  /// Optional: when set, must be an ACTIVE accountant assigned to the dealership.
+  assignedAccountantId String?        @map("assigned_accountant_id") @db.Uuid
+  /// First day of the billing month.
+  billingPeriod        DateTime       @map("billing_period") @db.Date
+  /// Vendor due date printed on the bill.
+  dueDate              DateTime       @map("due_date") @db.Date
+  /// Internal deadline for the accountant to submit.
+  submissionDeadline   DateTime       @map("submission_deadline") @db.Date
+  recurring            Boolean        @default(false)
+  instructions         String?
+  status               ScheduleStatus @default(SCHEDULED)
+  cancelledReason      String?        @map("cancelled_reason")
+  cancelledAt          DateTime?      @map("cancelled_at") @db.Timestamptz(6)
+  /// The recurring rule that generated this task, if any.
+  ruleId               String?        @map("rule_id") @db.Uuid
+  /// Last date a configured reminder notification was sent for this task.
+  reminderSentAt       DateTime?      @map("reminder_sent_at") @db.Timestamptz(6)
+  createdById          String         @map("created_by_id") @db.Uuid
+  createdAt            DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  dealership         Dealership            @relation(fields: [dealershipId], references: [id], onDelete: Restrict)
+  category           BillCategory          @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  assignedAccountant User?                 @relation("ScheduleAssignee", fields: [assignedAccountantId], references: [id], onDelete: SetNull)
+  createdBy          User                  @relation("ScheduleCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  rule               RecurringBillingRule? @relation(fields: [ruleId], references: [id], onDelete: Restrict)
+  bills              Bill[]
+
+  @@index([assignedAccountantId, submissionDeadline])
+  @@index([status, submissionDeadline])
+  @@index([dealershipId, billingPeriod])
+  @@index([ruleId, billingPeriod])
+  @@map("bill_schedules")
+}
+
+// ---------------------------------------------------------------------------
+// Bills & review audit
+// ---------------------------------------------------------------------------
+
+model Bill {
+  id                   String   @id @default(uuid()) @db.Uuid
+  /// Human-readable unique reference, e.g. AL-2026-000123.
+  billReference        String   @unique @map("bill_reference")
+  scheduleId           String?  @map("schedule_id") @db.Uuid
+  dealershipId         String   @map("dealership_id") @db.Uuid
+  categoryId           String   @map("category_id") @db.Uuid
+  /// First day of the billing month.
+  billingPeriod        DateTime @map("billing_period") @db.Date
+  billingDate          DateTime @map("billing_date") @db.Date
+  amount               Decimal  @db.Decimal(14, 2)
+  currency             String   @default("INR") @db.Char(3)
+  referenceNumber      String?  @map("reference_number")
+  /// Object key in private storage — never exposed raw beyond the API.
+  documentKey          String   @map("document_key")
+  originalDocumentName String   @map("original_document_name")
+  mimeType             String   @map("mime_type")
+  fileSizeBytes        Int      @map("file_size_bytes")
+  submittedById        String   @map("submitted_by_id") @db.Uuid
+  submittedAt          DateTime @default(now()) @map("submitted_at") @db.Timestamptz(6)
+  status               BillStatus @default(SUBMITTED)
+  resubmissionCount    Int      @default(0) @map("resubmission_count")
+  accountantNotes      String?  @map("accountant_notes")
+  adminNotes           String?  @map("admin_notes")
+  rejectionReason      String?  @map("rejection_reason")
+  reviewedById         String?  @map("reviewed_by_id") @db.Uuid
+  reviewedAt           DateTime? @map("reviewed_at") @db.Timestamptz(6)
+
+  // --- Extraction & consumer identity (populated by the bill scan workflow) ---
+  /// Normalized consumer identifier (JVVNL K-number / consumer a/c). Uppercased.
+  consumerNumber       String?  @map("consumer_number")
+  meterNumber          String?  @map("meter_number")
+  unitsKwh             Decimal? @map("units_kwh") @db.Decimal(12, 2)
+  /// Current-period charges excluding prior arrears (budget comparison base).
+  currentPeriodAmount Decimal? @map("current_period_amount") @db.Decimal(14, 2)
+  /// Previous-period payable amount — from the document or the matched bill.
+  previousBillAmount Decimal? @map("previous_bill_amount") @db.Decimal(14, 2)
+  /// Matched prior-period bill for the same consumer+dealership+category.
+  previousBillId     String?  @map("previous_bill_id") @db.Uuid
+  /// The scan that produced this bill (one scan → at most one bill).
+  scanId             String?  @unique @map("scan_id") @db.Uuid
+  /// Extractor warnings — document metadata, no confidential figures.
+  extractionWarnings Json?    @map("extraction_warnings")
+
+  // --- Budget comparison snapshot ---
+  /// Business rule: compare the CURRENT-PERIOD charge amount
+  /// (currentPeriodAmount when extracted, else total payable `amount`)
+  /// against the budget for dealership+category+billing month.
+  budgetStatus           BudgetComparisonStatus? @map("budget_status")
+  budgetComparisonAmount Decimal?                @map("budget_comparison_amount") @db.Decimal(14, 2)
+  /// Snapshot of the matched rule's monthly amount — admin-only, never
+  /// serialized to accountant responses.
+  budgetAmount           Decimal?  @map("budget_amount") @db.Decimal(14, 2)
+  budgetRuleId           String?   @map("budget_rule_id") @db.Uuid
+
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  schedule    BillSchedule? @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
+  dealership  Dealership    @relation(fields: [dealershipId], references: [id], onDelete: Restrict)
+  category    BillCategory  @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  submittedBy User          @relation("BillSubmittedBy", fields: [submittedById], references: [id], onDelete: Restrict)
+  reviewedBy  User?         @relation("BillReviewedBy", fields: [reviewedById], references: [id], onDelete: SetNull)
+  previousBill Bill?        @relation("BillPredecessor", fields: [previousBillId], references: [id], onDelete: SetNull)
+  nextBills    Bill[]       @relation("BillPredecessor")
+  scan        DocumentScan? @relation(fields: [scanId], references: [id], onDelete: SetNull)
+  budgetRule  BudgetRule?   @relation(fields: [budgetRuleId], references: [id], onDelete: SetNull)
+  history     BillReviewHistory[]
+
+  @@index([dealershipId, billingPeriod])
+  @@index([categoryId, billingPeriod])
+  @@index([consumerNumber, dealershipId])
+  @@index([submittedAt])
+  @@index([status])
+  @@index([submittedById])
+  @@map("bills")
+}
+
+/// Immutable audit trail — every review decision creates a record.
+/// No API endpoint may modify or delete rows.
+model BillReviewHistory {
+  id             String         @id @default(uuid()) @db.Uuid
+  billId         String         @map("bill_id") @db.Uuid
+  reviewerId     String         @map("reviewer_id") @db.Uuid
+  previousStatus BillStatus?    @map("previous_status")
+  newStatus      BillStatus     @map("new_status")
+  decision       ReviewDecision
+  reason         String?
+  notes          String?
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  bill     Bill @relation(fields: [billId], references: [id], onDelete: Cascade)
+  reviewer User @relation(fields: [reviewerId], references: [id], onDelete: Restrict)
+
+  @@index([billId, createdAt])
+  @@map("bill_review_history")
+}
+
+// ---------------------------------------------------------------------------
+// Document scans (temporary extraction staging, then linked to a bill)
+// ---------------------------------------------------------------------------
+
+/// A scanned bill upload awaiting/used by submission. Expires after
+/// SCAN_RETENTION_HOURS; at most one bill may consume a scan.
+model DocumentScan {
+  id               String             @id @default(uuid()) @db.Uuid
+  uploadedById     String             @map("uploaded_by_id") @db.Uuid
+  /// Context the accountant chose before/while scanning — optional hints.
+  dealershipId     String?            @map("dealership_id") @db.Uuid
+  categoryId       String?            @map("category_id") @db.Uuid
+  scheduleId       String?            @map("schedule_id") @db.Uuid
+
+  documentKey      String             @map("document_key")
+  originalFileName String             @map("original_file_name")
+  mimeType         String             @map("mime_type")
+  fileSizeBytes    Int                @map("file_size_bytes")
+
+  status           DocumentScanStatus @default(PROCESSING)
+  /// pdf_text | tesseract_ocr | none
+  extractionMethod String?            @map("extraction_method")
+  extractedJson    Json?              @map("extracted_json")
+  confidenceJson   Json?              @map("confidence_json")
+  warningsJson     Json?              @map("warnings_json")
+  pageCount        Int?               @map("page_count")
+  textLength       Int?               @map("text_length")
+
+  expiresAt        DateTime           @map("expires_at") @db.Timestamptz(6)
+  createdAt        DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  uploadedBy User         @relation(fields: [uploadedById], references: [id], onDelete: Cascade)
+  dealership Dealership?  @relation(fields: [dealershipId], references: [id], onDelete: SetNull)
+  category   BillCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  bill       Bill?
+
+  @@index([uploadedById, createdAt])
+  @@map("document_scans")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id                String           @id @default(uuid()) @db.Uuid
+  recipientId       String           @map("recipient_id") @db.Uuid
+  type              NotificationType
+  title             String
+  message           String
+  relatedEntityType String?          @map("related_entity_type")
+  relatedEntityId   String?          @map("related_entity_id") @db.Uuid
+  /// Job-generated notifications use this to stay idempotent.
+  deduplicationKey  String?          @map("deduplication_key")
+  readAt            DateTime?        @map("read_at") @db.Timestamptz(6)
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  recipient User @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@index([recipientId, createdAt])
+  @@index([recipientId, readAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Auth infra (refresh sessions & password resets — not business entities)
+// ---------------------------------------------------------------------------
+
+model RefreshToken {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  /// SHA-256 hash of the opaque refresh token. Raw token is never stored.
+  tokenHash     String    @unique @map("token_hash")
+  userAgent     String?   @map("user_agent")
+  ip            String?
+  expiresAt     DateTime  @map("expires_at") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  revokedAt     DateTime? @map("revoked_at") @db.Timestamptz(6)
+  replacedById  String?   @map("replaced_by_id") @db.Uuid
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
