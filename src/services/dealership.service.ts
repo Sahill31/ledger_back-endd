@@ -1,5 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../config/database";
+import { storage } from "../config/storage";
+import { logger } from "../config/logger";
 import { ApiError } from "../utils/ApiError";
 import { assertDealershipAccess } from "../middleware/authorizeRole";
 import type { RequestUser } from "../middleware/authenticate";
@@ -79,24 +81,56 @@ export const dealershipService = {
   },
 
   /**
-   * Permanent delete — only allowed while the dealership has no financial
-   * footprint (bills, schedules, budgets). Rows with history must be
-   * deactivated instead so the audit trail stays intact.
+   * Permanent delete — removes the dealership AND every dependent record it
+   * owns in one transaction: bills (+ review history via cascade), schedules,
+   * budget rules (+ history), scans, accountant assignments. Uploaded bill
+   * documents are then deleted from storage on a best-effort basis.
+   *
+   * This is destructive by admin request; deactivation is the safe default.
    */
   async remove(id: string): Promise<void> {
     const existing = await dealershipModel.findById(id);
     if (!existing) throw ApiError.notFound("Dealership not found.");
-    const [bills, schedules, budgets] = await Promise.all([
-      prisma.bill.count({ where: { dealershipId: id } }),
-      prisma.billSchedule.count({ where: { dealershipId: id } }),
-      prisma.budgetRule.count({ where: { dealershipId: id } }),
-    ]);
-    if (bills || schedules || budgets) {
-      throw ApiError.conflict(
-        `Cannot permanently delete: dealership has ${bills} bill(s), ${schedules} schedule(s) and ${budgets} budget(s). Deactivate it instead.`
-      );
+
+    const billRows = await prisma.bill.findMany({
+      where: { dealershipId: id },
+      select: { id: true, documentKey: true },
+    });
+    const scanRows = await prisma.documentScan.findMany({
+      where: { dealershipId: id },
+      select: { documentKey: true },
+    });
+    const scheduleIds = (
+      await prisma.billSchedule.findMany({
+        where: { dealershipId: id },
+        select: { id: true },
+      })
+    ).map((s) => s.id);
+
+    // Notifications point at entities via a loose relatedEntityId string —
+    // remove the ones referencing anything about to disappear.
+    const relatedIds = [id, ...billRows.map((b) => b.id), ...scheduleIds];
+
+    await prisma.$transaction(async (tx) => {
+      // Order matters — bills/schedules/budgets FK to the dealership with
+      // RESTRICT, so dependents go first.
+      await tx.notification.deleteMany({ where: { relatedEntityId: { in: relatedIds } } });
+      await tx.bill.deleteMany({ where: { dealershipId: id } });
+      await tx.billSchedule.deleteMany({ where: { dealershipId: id } });
+      await tx.budgetRule.deleteMany({ where: { dealershipId: id } });
+      await tx.documentScan.deleteMany({ where: { dealershipId: id } });
+      await tx.dealership.delete({ where: { id } });
+    });
+
+    // Best-effort storage cleanup — never fail the request over files.
+    const docKeys = [...billRows.map((b) => b.documentKey), ...scanRows.map((s) => s.documentKey)];
+    for (const documentKey of docKeys) {
+      try {
+        await storage.delete(documentKey);
+      } catch (err) {
+        logger.warn({ err, documentKey }, "orphaned storage object after dealership delete");
+      }
     }
-    await prisma.dealership.delete({ where: { id } });
   },
 
   /** Admin-only: accountants assigned to a dealership. */

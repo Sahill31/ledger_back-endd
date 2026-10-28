@@ -215,14 +215,23 @@ export const scheduleService = {
       throw ApiError.conflict("Schedule is already cancelled.");
     }
     const updated = await prisma.$transaction(async (tx) => {
-      // Cancelling a schedule that already has a non-rejected bill is blocked —
-      // the bill must be reviewed/rejected first so history stays consistent.
-      const activeBill = await tx.bill.findFirst({
-        where: { scheduleId: id, status: { not: BillStatus.REJECTED } },
+      // Only a bill still pending review blocks cancellation. Approved or
+      // rejected bills are settled — the schedule may be cancelled/closed out.
+      const pendingBill = await tx.bill.findFirst({
+        where: {
+          scheduleId: id,
+          status: {
+            in: [
+              BillStatus.SUBMITTED,
+              BillStatus.UNDER_REVIEW,
+              BillStatus.CORRECTION_REQUESTED,
+            ],
+          },
+        },
       });
-      if (activeBill) {
+      if (pendingBill) {
         throw ApiError.conflict(
-          "Cannot cancel a schedule that already has a submitted bill under review."
+          "A submitted bill is still pending review. Approve or reject the bill first, then cancel the schedule."
         );
       }
       return tx.billSchedule.update({
@@ -240,17 +249,29 @@ export const scheduleService = {
   },
 
   /**
-   * Permanent delete — schedules with bills keep their history, so only
-   * schedules that have no bills may be hard-deleted. Others should be
-   * cancelled instead.
+   * Permanent delete — a schedule may be hard-deleted as long as no bill is
+   * still pending review. Approved/rejected bills survive the delete
+   * (bills.schedule_id is ON DELETE SET NULL) so financial history is kept;
+   * they are simply unlinked from the removed schedule.
    */
   async remove(id: string, _admin: RequestUser): Promise<void> {
     const s = await prisma.billSchedule.findUnique({ where: { id } });
     if (!s) throw ApiError.notFound("Schedule not found.");
-    const bills = await prisma.bill.count({ where: { scheduleId: id } });
-    if (bills > 0) {
+    const pendingBills = await prisma.bill.count({
+      where: {
+        scheduleId: id,
+        status: {
+          in: [
+            BillStatus.SUBMITTED,
+            BillStatus.UNDER_REVIEW,
+            BillStatus.CORRECTION_REQUESTED,
+          ],
+        },
+      },
+    });
+    if (pendingBills > 0) {
       throw ApiError.conflict(
-        "Cannot permanently delete: schedule has submitted bills. Cancel it instead."
+        "Cannot permanently delete: a submitted bill is still pending review. Approve or reject the bill first, then delete the schedule."
       );
     }
     await prisma.billSchedule.delete({ where: { id } });
